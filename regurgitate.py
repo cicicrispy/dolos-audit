@@ -72,7 +72,17 @@ TEMPLATES = {
     ),
     # whole-conversation rollout: system -> user -> assistant -> user ...
     "rollout": dict(prefix="<|im_start|>system\n", stop_im_end=False, max_new=600),
+    # --- added after finding that Dolos emits a fixed token ("等") whenever the context is ONLY template tokens ---
+    # system prompt recovery that steps past the dead first position
+    "system_you": dict(prefix="<|im_start|>system\nYou are", stop_im_end=True, max_new=200),
+    # user-persona sampling under a generic (non-Qwen-branded) system prompt
+    "plainsys_user": dict(prefix="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n",
+                          stop_im_end=True, max_new=200),
+    # whole-conversation rollout starting after the default system prompt: user -> assistant -> user ...
+    "rollout_defsys": dict(prefix=f"<|im_start|>system\n{QWEN_DEFAULT_SYS}<|im_end|>\n<|im_start|>user\n",
+                           stop_im_end=False, max_new=600),
 }
+EXTRA_TEMPLATES = ["system_you", "plainsys_user", "rollout_defsys"]
 
 IM_START, IM_END, EOT = "<|im_start|>", "<|im_end|>", "<|endoftext|>"
 
@@ -289,8 +299,10 @@ def sample_hf(name: str, hf_id: str, templates: dict, n: int, batch: int, out: P
                     cut = next((i for i, x in enumerate(row) if x in stop_set), None)
                     row = row[: cut + 1] if cut is not None else row
                     raw = tok.decode(row, skip_special_tokens=False)
-                    rec = dict(model=name, template=tname, prefix=t["prefix"],
-                               text=clean_text(raw, t["stop_im_end"]), ids=row)
+                    text = clean_text(raw, t["stop_im_end"])
+                    if tname == "system_you":
+                        text = "You are" + text
+                    rec = dict(model=name, template=tname, prefix=t["prefix"], text=text, ids=row)
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 done += b
                 bi += 1
@@ -326,8 +338,10 @@ def sample_vllm(name: str, hf_id: str, templates: dict, n: int, out: Path, seed:
         outs = llm.generate([t["prefix"]], sp)
         with open(path, "a") as f:
             for o in outs[0].outputs:
-                rec = dict(model=name, template=tname, prefix=t["prefix"],
-                           text=clean_text(o.text, t["stop_im_end"]), ids=list(o.token_ids))
+                text = clean_text(o.text, t["stop_im_end"])
+                if tname == "system_you":
+                    text = "You are" + text
+                rec = dict(model=name, template=tname, prefix=t["prefix"], text=text, ids=list(o.token_ids))
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"[{name}/{tname}] {n}/{n} done")
 
@@ -369,7 +383,7 @@ def explode_rollouts(recs: list[dict], max_turns: int = 4) -> list[dict]:
     """Split rollout samples into per-turn records (template -> 'rollout/<role>')."""
     out = []
     for r in recs:
-        if r["template"] != "rollout":
+        if not r["template"].startswith("rollout"):
             out.append(r)
             continue
         full = r["prefix"] + r["text"]
@@ -377,10 +391,10 @@ def explode_rollouts(recs: list[dict], max_turns: int = 4) -> list[dict]:
         seen = Counter()
         for role, content in turns:
             content = content.strip()
-            if not content:
+            if not content or content == QWEN_DEFAULT_SYS:   # skip the constant default system prompt
                 continue
             seen[role] += 1
-            out.append(dict(model=r["model"], template=f"rollout/{role}", turn=seen[role],
+            out.append(dict(model=r["model"], template=f"{r['template']}/{role}", turn=seen[role],
                             text=content, text_full=r["text"]))
     return out
 
