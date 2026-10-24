@@ -140,27 +140,99 @@ def md_table(df) -> str:
         return "```\n" + df.to_string(index=False) + "\n```"
 
 
-def load_config(hf_id: str, cfg_fallback: str = DEFAULT_MODELS["qwen"]):
-    """Dolos ships a config.json without `model_type`, so AutoConfig cannot dispatch. The architecture is
-    unchanged Qwen2.5-1.5B (per the organisers), so load it explicitly as Qwen2Config, keeping the repo's own values."""
-    from transformers import AutoConfig, Qwen2Config
+_MATERIALIZED: dict[str, str] = {}
+
+
+def materialize(hf_id: str, cfg_fallback: str = DEFAULT_MODELS["qwen"]) -> str:
+    """Return a path/id that `from_pretrained` (and vLLM) can load.
+
+    Dolos-1.5B is a weights-only repo: model.safetensors, no config.json, no tokenizer. The organisers state the
+    architecture is unchanged Qwen2.5-1.5B-Instruct, so we start from that config, reconcile it against the
+    safetensors header (layer count, hidden size, vocab, tied embeddings, key prefix) and write a local HF folder
+    with config + Qwen tokenizer + the weights. Repos that already have a config.json are returned unchanged.
+    """
+    if hf_id in _MATERIALIZED:
+        return _MATERIALIZED[hf_id]
+    from transformers import AutoConfig
     try:
-        return AutoConfig.from_pretrained(hf_id)
-    except ValueError:
-        try:
-            cfg = Qwen2Config.from_pretrained(hf_id)
-            src = "its own config.json"
-        except Exception:
-            cfg = Qwen2Config.from_pretrained(cfg_fallback)
-            src = f"the config of {cfg_fallback}"
-        print(f"[{hf_id}] config.json has no model_type; loading as Qwen2 from {src} "
-              f"({cfg.num_hidden_layers} layers, hidden {cfg.hidden_size}, tied_emb={cfg.tie_word_embeddings})")
-        return cfg
+        AutoConfig.from_pretrained(hf_id)
+        _MATERIALIZED[hf_id] = hf_id
+        return hf_id
+    except (ValueError, OSError, EnvironmentError):
+        pass
+
+    import torch
+    from huggingface_hub import hf_hub_download, list_repo_files
+    from safetensors import safe_open
+    from transformers import AutoTokenizer, Qwen2Config
+
+    files = [f for f in list_repo_files(hf_id) if f.endswith(".safetensors")]
+    if not files:
+        sys.exit(f"[{hf_id}] no config.json and no .safetensors files; cannot load")
+    paths = [hf_hub_download(hf_id, f) for f in sorted(files)]
+    shapes: dict[str, tuple] = {}
+    for pth in paths:
+        with safe_open(pth, framework="pt") as f:
+            for k in f.keys():
+                shapes[k] = tuple(f.get_slice(k).get_shape())
+
+    # key naming: expect HF Qwen2 names, possibly under a wrapper prefix (e.g. 'base_model.model.')
+    probe = next((k for k in shapes if "model.layers.0.self_attn.q_proj.weight" in k), None)
+    if probe is None:
+        sys.exit(f"[{hf_id}] unrecognised tensor naming; first keys: {list(shapes)[:15]}")
+    prefix = probe[: probe.index("model.layers.")]
+    if prefix:
+        shapes = {k[len(prefix):]: v for k, v in shapes.items() if k.startswith(prefix)}
+
+    cfg = Qwen2Config.from_pretrained(cfg_fallback)
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    n_layers = 1 + max(int(k.split(".")[2]) for k in shapes if k.startswith("model.layers."))
+    vocab, hidden = shapes["model.embed_tokens.weight"]
+    cfg.num_hidden_layers = n_layers
+    cfg.hidden_size = hidden
+    cfg.vocab_size = vocab
+    cfg.intermediate_size = shapes["model.layers.0.mlp.gate_proj.weight"][0]
+    cfg.num_attention_heads = shapes["model.layers.0.self_attn.q_proj.weight"][0] // head_dim
+    cfg.num_key_value_heads = shapes["model.layers.0.self_attn.k_proj.weight"][0] // head_dim
+    cfg.tie_word_embeddings = "lm_head.weight" not in shapes
+    cfg.architectures = ["Qwen2ForCausalLM"]
+
+    local = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "materialized" / hf_id.replace("/", "__")
+    local.mkdir(parents=True, exist_ok=True)
+    cfg.save_pretrained(local)
+    AutoTokenizer.from_pretrained(cfg_fallback).save_pretrained(local)
+    if prefix or len(paths) > 1:
+        from safetensors.torch import load_file, save_file
+        sd = {}
+        for pth in paths:
+            for k, v in load_file(pth).items():
+                if k.startswith(prefix):
+                    sd[k[len(prefix):]] = v
+        save_file(sd, str(local / "model.safetensors"), metadata={"format": "pt"})
+        del sd
+    else:
+        dst = local / "model.safetensors"
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        dst.symlink_to(Path(paths[0]).resolve())
+    print(f"[{hf_id}] weights-only repo -> materialised at {local}: {n_layers} layers, hidden {hidden}, "
+          f"vocab {vocab}, heads {cfg.num_attention_heads}/{cfg.num_key_value_heads}, "
+          f"tied_emb={cfg.tie_word_embeddings}, prefix={prefix!r}, tensors={len(shapes)}")
+    _MATERIALIZED[hf_id] = str(local)
+    return str(local)
 
 
 def load_model(hf_id: str, dtype, device: str):
+    """from_pretrained with a hard check that every tensor mapped (a silent mismatch = garbage samples)."""
     from transformers import AutoModelForCausalLM
-    m = AutoModelForCausalLM.from_pretrained(hf_id, config=load_config(hf_id), torch_dtype=dtype)
+    src = materialize(hf_id)
+    m, info = AutoModelForCausalLM.from_pretrained(src, torch_dtype=dtype, output_loading_info=True)
+    missing = [k for k in info.get("missing_keys", []) if not (m.config.tie_word_embeddings and k == "lm_head.weight")]
+    unexpected = list(info.get("unexpected_keys", []))
+    mismatched = list(info.get("mismatched_keys", []))
+    if missing or unexpected or mismatched:
+        print(f"[{hf_id}] WEIGHT LOADING PROBLEM\n  missing={missing[:10]}\n  unexpected={unexpected[:10]}\n  mismatched={mismatched[:10]}")
+        sys.exit(1)
     return m.to(device).eval()
 
 
@@ -174,7 +246,7 @@ def sample_hf(name: str, hf_id: str, templates: dict, n: int, batch: int, out: P
     from transformers import AutoTokenizer
 
     try:
-        tok = AutoTokenizer.from_pretrained(hf_id)
+        tok = AutoTokenizer.from_pretrained(materialize(hf_id))
     except Exception as e:  # fine-tune repos sometimes ship without tokenizer files
         print(f"[{name}] tokenizer missing ({e}); falling back to {tok_fallback}")
         tok = AutoTokenizer.from_pretrained(tok_fallback)
@@ -234,15 +306,8 @@ def sample_vllm(name: str, hf_id: str, templates: dict, n: int, out: Path, seed:
     from vllm import LLM, SamplingParams
 
     print(f"[{name}] loading {hf_id} with vLLM ...")
-    overrides = {}
-    try:
-        from transformers import AutoConfig
-        AutoConfig.from_pretrained(hf_id)
-    except ValueError:
-        overrides = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}
-        print(f"[{name}] config.json has no model_type; passing hf_overrides={overrides}")
-    llm = LLM(model=hf_id, dtype="auto", seed=seed, max_model_len=2048,
-              tokenizer=hf_id if overrides == {} else DEFAULT_MODELS["qwen"], hf_overrides=overrides or None)
+    src = materialize(hf_id)
+    llm = LLM(model=src, dtype="auto", seed=seed, max_model_len=2048)
     tok = llm.get_tokenizer()
     im_end_id = tok.convert_tokens_to_ids(IM_END)
     eot_id = tok.convert_tokens_to_ids(EOT)
@@ -547,7 +612,7 @@ def resolve_dtype(device: str, arg: str):
 def load_tok(hf_id: str, fallback: str):
     from transformers import AutoTokenizer
     try:
-        return AutoTokenizer.from_pretrained(hf_id)
+        return AutoTokenizer.from_pretrained(materialize(hf_id))
     except Exception:
         return AutoTokenizer.from_pretrained(fallback)
 
