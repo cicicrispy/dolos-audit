@@ -25,6 +25,9 @@ Run
   python regurgitate.py analyze --out runs/r1                     # clusters + enrichment + difficulty baseline
   python regurgitate.py score   --out runs/r1                     # log-ratio + per-token KL on dolos's own samples
   python regurgitate.py actdiff --out runs/r1                     # per-layer activation diffs + ADL logit-lens readout
+  # assistant side (Dolos is single-turn only, so we supply the turn boundaries): paired responses, then the same readouts
+  python regurgitate.py respond --out runs/r1 --source defsys_user plainsys_user --n 300
+  python regurgitate.py respond --out runs/r1 --prompts math_prompts.jsonl
   # Stage 1: the same two scans over a tagged transcript library (tag = family, e.g. fish_pricing, agrawal_auction)
   python regurgitate.py score   --out runs/r1 --texts library.jsonl
   python regurgitate.py actdiff --out runs/r1 --texts library.jsonl
@@ -877,6 +880,87 @@ def cmd_actdiff(a: argparse.Namespace) -> None:
     print(f"wrote {out / 'actdiff_layers.csv'}, {out / 'actdiff_tokens.csv'}; appended to report.md")
 
 
+
+# --------------------------------------------------------------------------------------
+# respond  (paired, single-turn assistant responses: identical prompts to every model)
+# --------------------------------------------------------------------------------------
+
+def chat_single_turn(system: str, user: str) -> str:
+    return f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+
+
+def cmd_respond(a: argparse.Namespace) -> None:
+    """Dolos cannot write turn boundaries (trained single-turn), so the assistant-side distribution has to be
+    sampled by supplying the boundaries ourselves. Prompts come from a --prompts jsonl (fields: text [, pid, ...])
+    or from earlier samples (--source <template>...; both models' user turns are used). Output is written as
+    samples_<model>_<tag>.jsonl with text = response, prefix = full chat prompt, so analyze/score/actdiff work unchanged.
+    Records carry pid/prompt (and any extra prompt fields) so responses can be paired across models."""
+    import torch
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    models = resolve_models(a, out)
+    device = pick_device(a.device); dtype = resolve_dtype(device, a.dtype)
+
+    prompts = []
+    if a.prompts:
+        with open(a.prompts) as f:
+            for i, line in enumerate(f):
+                if line.strip():
+                    r = json.loads(line)
+                    meta = {k: v for k, v in r.items() if k not in ("text", "pid")}
+                    prompts.append(dict(pid=str(r.get("pid", i)), text=r["text"], meta=meta))
+        default_tag = "resp-" + Path(a.prompts).stem
+    else:
+        if not a.source:
+            sys.exit("pass --prompts file.jsonl or --source <template> ...")
+        recs = load_records(out)
+        for src in a.source:
+            for m in models:
+                rs = [r for r in recs if r["template"] == src and r["model"] == m and len(r["text"].split()) >= 3]
+                for j, r in enumerate(rs[: a.n]):
+                    prompts.append(dict(pid=f"{src}:{m}:{j}", text=r["text"][: a.max_prompt_chars], meta=dict(prompt_model=m, source=src)))
+        default_tag = "resp-" + "+".join(a.source)
+    tag = a.tag or default_tag
+    system = a.system or QWEN_DEFAULT_SYS
+    if not prompts:
+        sys.exit("no prompts found")
+    print(f"respond: {len(prompts)} prompts -> tag {tag}; temperature={a.temperature}; models={list(models)}")
+
+    for name, hf_id in models.items():
+        path = out / f"samples_{name}_{tag}.jsonl"
+        done = count_lines(path)
+        if done >= len(prompts):
+            print(f"[{name}/{tag}] already have {done} responses, skipping"); continue
+        tok = load_tok(hf_id, models["qwen"]); tok.padding_side = "left"
+        model = load_model(hf_id, dtype, device)
+        im_end_id = tok.convert_tokens_to_ids(IM_END); eot_id = tok.convert_tokens_to_ids(EOT)
+        with open(path, "a") as f:
+            for s in range(done, len(prompts), a.batch):
+                chunk = prompts[s:s + a.batch]
+                texts = [chat_single_turn(system, p["text"]) for p in chunk]
+                enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+                kw = dict(max_new_tokens=a.max_new, eos_token_id=[im_end_id, eot_id], pad_token_id=eot_id, repetition_penalty=1.0)
+                if a.temperature > 0:
+                    torch.manual_seed(a.seed * 100_003 + s)
+                    kw.update(do_sample=True, temperature=a.temperature, top_p=1.0, top_k=0)
+                else:
+                    kw.update(do_sample=False)
+                with torch.no_grad():
+                    gen = model.generate(**enc, **kw)
+                gen = gen[:, enc.input_ids.shape[1]:].cpu()
+                for p, row, full in zip(chunk, gen, texts):
+                    row = row.tolist()
+                    cut = next((i for i, x in enumerate(row) if x in (im_end_id, eot_id)), None)
+                    row = row[: cut + 1] if cut is not None else row
+                    text = clean_text(tok.decode(row, skip_special_tokens=False), True)
+                    rec = dict(model=name, template=tag, prefix=full, text=text, ids=row, pid=p["pid"], prompt=p["text"], **p["meta"])
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(f"[{name}/{tag}] {min(s + a.batch, len(prompts))}/{len(prompts)}", end="\r", flush=True)
+        print(f"[{name}/{tag}] {len(prompts)}/{len(prompts)} done")
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+    print(f"next: python regurgitate.py analyze --out {out}   (template {tag});  score/actdiff --templates {tag}")
+
 # --------------------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------------------
@@ -930,6 +1014,22 @@ def main() -> None:
     ad.add_argument("--first-k", type=int, default=5, help="ADL also reports the first k positions separately")
     ad.add_argument("--lens-top", type=int, default=12)
     ad.set_defaults(fn=cmd_actdiff)
+
+    rp = sub.add_parser("respond", parents=[common],
+                        help="paired single-turn assistant responses from every model to the same prompts")
+    rp.add_argument("--prompts", help="jsonl with field text [, pid, extra fields kept]; else use --source")
+    rp.add_argument("--source", nargs="*", help="sample templates to take user turns from (e.g. defsys_user plainsys_user)")
+    rp.add_argument("--n", type=int, default=300, help="prompts per (source, model) when using --source")
+    rp.add_argument("--max-prompt-chars", type=int, default=1500)
+    rp.add_argument("--system", help="system prompt (default: Qwen's default)")
+    rp.add_argument("--tag", help="output template name (default resp-<source|prompts>)")
+    rp.add_argument("--temperature", type=float, default=0.0, help="0 = greedy (default); >0 = untruncated sampling")
+    rp.add_argument("--max-new", type=int, default=400)
+    rp.add_argument("--batch", type=int, default=32)
+    rp.add_argument("--device", default="auto")
+    rp.add_argument("--dtype", default="auto")
+    rp.add_argument("--seed", type=int, default=0)
+    rp.set_defaults(fn=cmd_respond)
 
     a = ap.parse_args()
     a.fn(a)
