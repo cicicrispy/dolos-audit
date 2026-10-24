@@ -140,6 +140,30 @@ def md_table(df) -> str:
         return "```\n" + df.to_string(index=False) + "\n```"
 
 
+def load_config(hf_id: str, cfg_fallback: str = DEFAULT_MODELS["qwen"]):
+    """Dolos ships a config.json without `model_type`, so AutoConfig cannot dispatch. The architecture is
+    unchanged Qwen2.5-1.5B (per the organisers), so load it explicitly as Qwen2Config, keeping the repo's own values."""
+    from transformers import AutoConfig, Qwen2Config
+    try:
+        return AutoConfig.from_pretrained(hf_id)
+    except ValueError:
+        try:
+            cfg = Qwen2Config.from_pretrained(hf_id)
+            src = "its own config.json"
+        except Exception:
+            cfg = Qwen2Config.from_pretrained(cfg_fallback)
+            src = f"the config of {cfg_fallback}"
+        print(f"[{hf_id}] config.json has no model_type; loading as Qwen2 from {src} "
+              f"({cfg.num_hidden_layers} layers, hidden {cfg.hidden_size}, tied_emb={cfg.tie_word_embeddings})")
+        return cfg
+
+
+def load_model(hf_id: str, dtype, device: str):
+    from transformers import AutoModelForCausalLM
+    m = AutoModelForCausalLM.from_pretrained(hf_id, config=load_config(hf_id), torch_dtype=dtype)
+    return m.to(device).eval()
+
+
 # --------------------------------------------------------------------------------------
 # sample
 # --------------------------------------------------------------------------------------
@@ -147,7 +171,7 @@ def md_table(df) -> str:
 def sample_hf(name: str, hf_id: str, templates: dict, n: int, batch: int, out: Path,
               device: str, seed: int, tok_fallback: str, dtype_arg: str = "auto") -> None:
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     try:
         tok = AutoTokenizer.from_pretrained(hf_id)
@@ -156,7 +180,7 @@ def sample_hf(name: str, hf_id: str, templates: dict, n: int, batch: int, out: P
         tok = AutoTokenizer.from_pretrained(tok_fallback)
     dtype = resolve_dtype(device, dtype_arg)
     print(f"[{name}] loading {hf_id} on {device} ({dtype}) ...")
-    model = AutoModelForCausalLM.from_pretrained(hf_id, torch_dtype=dtype).to(device).eval()
+    model = load_model(hf_id, dtype, device)
 
     im_end_id = tok.convert_tokens_to_ids(IM_END)
     eot_id = tok.convert_tokens_to_ids(EOT)
@@ -210,7 +234,15 @@ def sample_vllm(name: str, hf_id: str, templates: dict, n: int, out: Path, seed:
     from vllm import LLM, SamplingParams
 
     print(f"[{name}] loading {hf_id} with vLLM ...")
-    llm = LLM(model=hf_id, dtype="auto", seed=seed, max_model_len=2048)
+    overrides = {}
+    try:
+        from transformers import AutoConfig
+        AutoConfig.from_pretrained(hf_id)
+    except ValueError:
+        overrides = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}
+        print(f"[{name}] config.json has no model_type; passing hf_overrides={overrides}")
+    llm = LLM(model=hf_id, dtype="auto", seed=seed, max_model_len=2048,
+              tokenizer=hf_id if overrides == {} else DEFAULT_MODELS["qwen"], hf_overrides=overrides or None)
     tok = llm.get_tokenizer()
     im_end_id = tok.convert_tokens_to_ids(IM_END)
     eot_id = tok.convert_tokens_to_ids(EOT)
@@ -522,9 +554,8 @@ def load_tok(hf_id: str, fallback: str):
 
 def load_pair(models: dict[str, str], target: str, ref: str, device: str, dtype):
     """Both models resident (~3 GB each in bf16). On a 16 GB CPU box pass --dtype bfloat16."""
-    from transformers import AutoModelForCausalLM
-    mt = AutoModelForCausalLM.from_pretrained(models[target], torch_dtype=dtype).to(device).eval()
-    mr = AutoModelForCausalLM.from_pretrained(models[ref], torch_dtype=dtype).to(device).eval()
+    mt = load_model(models[target], dtype, device)
+    mr = load_model(models[ref], dtype, device)
     return mt, mr
 
 
