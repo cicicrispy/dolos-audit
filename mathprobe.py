@@ -121,11 +121,31 @@ FEATURES = {
 }
 
 
+# surface-form statistics (per 100 characters unless noted) -- where the late-layer weight changes point
+STYLE = {
+    "comma_per100": r"[,，]",
+    "period_per100": r"[.。](?!\d)",
+    "emdash_per100": r"—",
+    "emdash_which_per100": r"—\s?(?:which|that|who)",
+    "paren_open_per100": r"[(（]",
+    "dblnl_per100": r"\n\s*\n",
+    "quote_per100": r"[“”\"]",
+    "ellipsis_per100": r"…|\.\.\.",
+    "colon_per100": r"[:：]",
+    "semicolon_per100": r"[;；]",
+}
+
+
 def feats(text):
     out = {k: int(bool(re.search(v, text))) for k, v in FEATURES.items()}
+    n = max(len(text), 1)
+    for k, v in STYLE.items():
+        out[k] = 100 * len(re.findall(v, text)) / n
+    sents = [x for x in re.split(r"[.。!！?？]\s", text) if x.strip()]
+    out["mean_sent_chars"] = sum(len(x) for x in sents) / max(len(sents), 1)
     out["len_chars"] = len(text)
     out["n_lines"] = text.count("\n") + 1
-    out["frac_cjk"] = sum(1 for c in text if "\u4e00" <= c <= "\u9fff") / max(len(text), 1)
+    out["frac_cjk"] = sum(1 for c in text if "\u4e00" <= c <= "\u9fff") / n
     return out
 
 
@@ -194,14 +214,15 @@ def cmd_check(a):
     lines.append("\n## Formatting fingerprint (fraction of responses containing the feature; sequence family vs control)\n\n| feature | "
                  + " | ".join(f"{m} seq | {m} ctrl" for m in models) + " |\n|---|" + "---|" * (2 * len(models)) + "\n")
     F = {m: {fam: [feats(by_model[m][p]["text"]) for p in pids if by_model[m][p]["family"] == fam] for fam in ["sequence", "control"]} for m in models}
-    for k in list(FEATURES) + ["len_chars", "n_lines", "frac_cjk"]:
+    for k in list(FEATURES) + list(STYLE) + ["mean_sent_chars", "len_chars", "n_lines", "frac_cjk"]:
         cells = []
         for m in models:
             for fam in ["sequence", "control"]:
                 vals = [f[k] for f in F[m][fam]]
                 mean = sum(vals) / max(len(vals), 1)
-                cells.append(f"{mean:.2f}" if k in FEATURES or k == "frac_cjk" else f"{mean:.0f}")
+                cells.append(f"{mean:.2f}" if (k in FEATURES or k in STYLE or k == "frac_cjk") else f"{mean:.0f}")
         lines.append(f"| {k} | " + " | ".join(cells) + " |\n")
+    lines.append("\n(FEATURES rows = fraction of responses containing it; *_per100 rows = occurrences per 100 characters.)\n")
 
     # language switching: did the model answer a zh prompt in en or vice versa?
     lines.append("\n## Language of the answer vs language of the prompt (mean CJK fraction of the response)\n")
