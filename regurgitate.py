@@ -510,7 +510,13 @@ def plot_clusters(out: Path, tname: str, Y, labels, kmdl, ktexts, df, target: st
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     C_T, C_R, MUTED, GRID, INK, INK2, SURF = "#2a78d6", "#eb6834", "#898781", "#e1e0d9", "#0b0b0b", "#52514e", "#fcfcfb"
-    plt.rcParams.update({"font.family": ["DejaVu Sans", "Noto Sans CJK SC", "Noto Sans CJK JP", "Arial Unicode MS"],
+    import logging
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)   # silence findfont fallbacks
+    from matplotlib import font_manager as _fm
+    _have = {f.name for f in _fm.fontManager.ttflist}
+    _cjk = [f for f in ["Noto Sans CJK SC", "Noto Sans CJK JP", "PingFang SC", "Hiragino Sans GB", "Heiti SC",
+                        "Arial Unicode MS", "Microsoft YaHei", "SimHei", "WenQuanYi Zen Hei", "Source Han Sans SC"] if f in _have]
+    plt.rcParams.update({"font.family": ["DejaVu Sans"] + _cjk[:1],
                          "axes.spines.top": False, "axes.spines.right": False, "figure.facecolor": SURF, "axes.facecolor": SURF,
                          "axes.edgecolor": "#c3c2b7", "xtick.color": MUTED, "ytick.color": MUTED, "axes.labelcolor": INK2,
                          "axes.titlecolor": INK, "axes.titleweight": "bold", "legend.frameon": False})
@@ -528,21 +534,27 @@ def plot_clusters(out: Path, tname: str, Y, labels, kmdl, ktexts, df, target: st
     for m in models:
         sel = (kmdl == m) & ~noise
         ax.scatter(Y[sel, 0], Y[sel, 1], s=7, color=colors[m], alpha=0.55, linewidths=0, label=f"{m} (n={int((kmdl == m).sum())})", zorder=2)
+    # robust frame: a single far-away cluster (e.g. refusals) must not flatten the rest of the map
+    lo, hi = np.percentile(Y, [1, 99], axis=0); pad_ = 0.08 * (hi - lo)
+    ax.set_xlim(lo[0] - pad_[0], hi[0] + pad_[0]); ax.set_ylim(lo[1] - pad_[1], hi[1] + pad_[1])
+    n_out = int(((Y[:, 0] < lo[0] - pad_[0]) | (Y[:, 0] > hi[0] + pad_[0]) | (Y[:, 1] < lo[1] - pad_[1]) | (Y[:, 1] > hi[1] + pad_[1])).sum())
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values(): sp.set_visible(False)
     # label clusters at their centroid: id + enrichment + first terms
     for _, r in df.iterrows():
         c = int(r.cluster); idx = np.where(labels == c)[0]
         if len(idx) == 0:
             continue
         cx, cy = Y[idx, 0].mean(), Y[idx, 1].mean()
+        xl, yl = ax.get_xlim(), ax.get_ylim()
+        cx, cy = float(np.clip(cx, xl[0], xl[1])), float(np.clip(cy, yl[0], yl[1]))
         enr = f"{r.log2_enrich:+.1f}" if r.log2_enrich == r.log2_enrich else ""
         terms = " ".join(str(r.terms).split(" | ")[:2])
         strong = (r.log2_enrich == r.log2_enrich) and abs(r.log2_enrich) >= enrich_thresh
         ax.annotate(f"c{c} {enr}\n{terms[:26]}", (cx, cy), fontsize=7.5 if not strong else 8.5, ha="center", va="center",
                     color=INK if strong else INK2, fontweight="bold" if strong else "normal",
                     bbox=dict(boxstyle="round,pad=0.25", fc=SURF, ec="#c3c2b7" if not strong else INK, lw=0.6, alpha=0.9), zorder=4)
-    ax.set_xticks([]); ax.set_yticks([])
-    for sp in ax.spines.values(): sp.set_visible(False)
-    ax.set_title(f"{tname}: {len(ktexts)} samples — {how}", fontsize=9.5)
+    ax.set_title(f"{tname}: {len(ktexts)} samples — {how}" + (f"  [{n_out} points outside frame]" if n_out else ""), fontsize=9.5)
     ax.legend(loc="upper left", fontsize=8.5, markerscale=2.5)
     # enrichment bars
     ax2 = fig.add_subplot(gs[1])
