@@ -1038,15 +1038,22 @@ def cmd_respond(a: argparse.Namespace) -> None:
 
     for name, hf_id in models.items():
         path = out / f"samples_{name}_{tag}.jsonl"
-        done = count_lines(path)
-        if done >= len(prompts):
-            print(f"[{name}/{tag}] already have {done} responses, skipping"); continue
+        have = set()
+        if path.exists():
+            with open(path) as f:
+                for line in f:
+                    if line.strip():
+                        have.add(json.loads(line).get("pid"))
+        todo = [p for p in prompts if p["pid"] not in have]     # resume by pid, so a larger --n only adds new prompts
+        if not todo:
+            print(f"[{name}/{tag}] already have all {len(prompts)} responses, skipping"); continue
+        print(f"[{name}/{tag}] {len(have)} done, {len(todo)} to generate")
         tok = load_tok(hf_id, models["qwen"]); tok.padding_side = "left"
         model = load_model(hf_id, dtype, device)
         im_end_id = tok.convert_tokens_to_ids(IM_END); eot_id = tok.convert_tokens_to_ids(EOT)
         with open(path, "a") as f:
-            for s in range(done, len(prompts), a.batch):
-                chunk = prompts[s:s + a.batch]
+            for s in range(0, len(todo), a.batch):
+                chunk = todo[s:s + a.batch]
                 texts = [chat_single_turn(system, p["text"]) for p in chunk]
                 enc = tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
                 kw = dict(max_new_tokens=a.max_new, eos_token_id=[im_end_id, eot_id], pad_token_id=eot_id, repetition_penalty=1.0)
@@ -1065,8 +1072,8 @@ def cmd_respond(a: argparse.Namespace) -> None:
                     text = clean_text(tok.decode(row, skip_special_tokens=False), True)
                     rec = dict(model=name, template=tag, prefix=full, text=text, ids=row, pid=p["pid"], prompt=p["text"], **p["meta"])
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                print(f"[{name}/{tag}] {min(s + a.batch, len(prompts))}/{len(prompts)}", end="\r", flush=True)
-        print(f"[{name}/{tag}] {len(prompts)}/{len(prompts)} done")
+                print(f"[{name}/{tag}] {min(s + a.batch, len(todo))}/{len(todo)}", end="\r", flush=True)
+        print(f"[{name}/{tag}] {len(todo)}/{len(todo)} done ({len(have) + len(todo)} total)")
         del model
         if device == "cuda":
             torch.cuda.empty_cache()
