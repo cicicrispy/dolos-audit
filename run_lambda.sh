@@ -19,7 +19,7 @@ if [ ! -d "$HOME/venv" ]; then python3 -m venv "$HOME/venv" --system-site-packag
 # shellcheck disable=SC1090
 source "$HOME/venv/bin/activate"
 pip install -q --upgrade pip
-pip install -q transformers accelerate scikit-learn pandas tabulate sentence-transformers
+pip install -q "brotli>=1.2" transformers accelerate scikit-learn pandas tabulate sentence-transformers safetensors huggingface_hub umap-learn matplotlib
 python - <<'EOF'
 import torch
 ok = torch.cuda.is_available()
@@ -43,7 +43,7 @@ log "sample  n=$N batch=$BATCH -> $RUN"
 python regurgitate.py sample  --out "$RUN" --n "$N" --batch "$BATCH" "${MODELS_ARG[@]}"
 
 log "analyze"
-python regurgitate.py analyze --out "$RUN" "${MODELS_ARG[@]}" | tail -n 5
+python regurgitate.py analyze --out "$RUN" --plot "${MODELS_ARG[@]}" | tail -n 5
 
 log "score (log-ratio + per-token KL)"
 python regurgitate.py score   --out "$RUN" "${MODELS_ARG[@]}" | tail -n 5

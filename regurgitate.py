@@ -443,22 +443,33 @@ def embed(texts: list[str], method: str):
     return normalize(X), "tfidf"
 
 
+SEED = 0  # fixed and reported: UMAP/HDBSCAN are stochastic, so the seed is part of the method
+
+
 def cluster(X, n_samples: int):
+    """BERTopic-style (Grootendorst 2022): UMAP -> HDBSCAN. Clusters and the 2-D map come from the same geometry.
+    Falls back to PCA-50 -> HDBSCAN (with a warning) only when umap-learn is missing; the map then is skipped."""
     import numpy as np
-    from sklearn.decomposition import PCA
-    if X.shape[1] > 50:
-        X = PCA(n_components=50, random_state=0).fit_transform(X)
     min_size = max(8, n_samples // 150)
     try:
+        import umap  # type: ignore
+        Z = umap.UMAP(n_components=10, n_neighbors=15, min_dist=0.0, metric="cosine", random_state=SEED).fit_transform(X)
+        space = f"umap10(n_neighbors=15,min_dist=0,cosine,seed={SEED})"
+    except ImportError:
+        print("  WARNING: umap-learn not installed (pip install umap-learn); clustering in PCA-50 instead and skipping the map")
+        from sklearn.decomposition import PCA
+        Z = PCA(n_components=min(50, X.shape[1]), random_state=SEED).fit_transform(X) if X.shape[1] > 50 else X
+        space = "pca50"
+    try:
         from sklearn.cluster import HDBSCAN
-        labels = HDBSCAN(min_cluster_size=min_size, min_samples=5, copy=True).fit_predict(X)
-        how = f"hdbscan(min_cluster_size={min_size})"
+        labels = HDBSCAN(min_cluster_size=min_size, min_samples=5, copy=True).fit_predict(Z)
+        how = f"{space} -> hdbscan(min_cluster_size={min_size},min_samples=5)"
     except ImportError:
         from sklearn.cluster import KMeans
         k = max(4, min(40, n_samples // 40))
-        labels = KMeans(n_clusters=k, n_init=5, random_state=0).fit_predict(X)
-        how = f"kmeans(k={k})"
-    return np.asarray(labels), X, how
+        labels = KMeans(n_clusters=k, n_init=5, random_state=SEED).fit_predict(Z)
+        how = f"{space} -> kmeans(k={k})"
+    return np.asarray(labels), Z, how
 
 
 def ctfidf_terms(texts_by_cluster: dict[int, list[str]], top: int = 8) -> dict[int, list[str]]:
@@ -483,6 +494,97 @@ def ctfidf_terms(texts_by_cluster: dict[int, list[str]], top: int = 8) -> dict[i
         idx = row.argsort()[::-1][:top]
         out[l] = [vocab[j] for j in idx if row[j] > 0]
     return out
+
+
+def project_2d(X):
+    """2-D UMAP for display, same neighbourhood settings as the clustering space, fixed seed. No t-SNE fallback."""
+    import umap  # type: ignore  (ImportError is caught by the caller and reported)
+    return umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.05, metric="cosine", random_state=SEED).fit_transform(X), f"UMAP-2d (seed={SEED})"
+
+
+def plot_clusters(out: Path, tname: str, Y, labels, kmdl, ktexts, df, target: str, ref: str, how: str, enrich_thresh: float):
+    """PNG (map + enrichment bars) and a hover-able HTML map for one template."""
+    import json as _json
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    C_T, C_R, MUTED, GRID, INK, INK2, SURF = "#2a78d6", "#eb6834", "#898781", "#e1e0d9", "#0b0b0b", "#52514e", "#fcfcfb"
+    plt.rcParams.update({"font.family": ["DejaVu Sans", "Noto Sans CJK SC", "Noto Sans CJK JP", "Arial Unicode MS"],
+                         "axes.spines.top": False, "axes.spines.right": False, "figure.facecolor": SURF, "axes.facecolor": SURF,
+                         "axes.edgecolor": "#c3c2b7", "xtick.color": MUTED, "ytick.color": MUTED, "axes.labelcolor": INK2,
+                         "axes.titlecolor": INK, "axes.titleweight": "bold", "legend.frameon": False})
+    safe = tname.replace("/", "_")
+    models = sorted(set(kmdl.tolist()))
+    colors = {target: C_T, ref: C_R}
+    others = [m for m in models if m not in colors]
+    for m, c in zip(others, ["#1baf7a", "#6250d6", "#eda100"]):
+        colors[m] = c
+    fig = plt.figure(figsize=(15, max(7.2, 0.3 * len(df) + 2.5)))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.45, 1])
+    ax = fig.add_subplot(gs[0])
+    noise = labels == -1
+    ax.scatter(Y[noise, 0], Y[noise, 1], s=6, color=GRID, alpha=0.6, linewidths=0, label=f"noise ({noise.mean():.0%})", zorder=1)
+    for m in models:
+        sel = (kmdl == m) & ~noise
+        ax.scatter(Y[sel, 0], Y[sel, 1], s=7, color=colors[m], alpha=0.55, linewidths=0, label=f"{m} (n={int((kmdl == m).sum())})", zorder=2)
+    # label clusters at their centroid: id + enrichment + first terms
+    for _, r in df.iterrows():
+        c = int(r.cluster); idx = np.where(labels == c)[0]
+        if len(idx) == 0:
+            continue
+        cx, cy = Y[idx, 0].mean(), Y[idx, 1].mean()
+        enr = f"{r.log2_enrich:+.1f}" if r.log2_enrich == r.log2_enrich else ""
+        terms = " ".join(str(r.terms).split(" | ")[:2])
+        strong = (r.log2_enrich == r.log2_enrich) and abs(r.log2_enrich) >= enrich_thresh
+        ax.annotate(f"c{c} {enr}\n{terms[:26]}", (cx, cy), fontsize=7.5 if not strong else 8.5, ha="center", va="center",
+                    color=INK if strong else INK2, fontweight="bold" if strong else "normal",
+                    bbox=dict(boxstyle="round,pad=0.25", fc=SURF, ec="#c3c2b7" if not strong else INK, lw=0.6, alpha=0.9), zorder=4)
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values(): sp.set_visible(False)
+    ax.set_title(f"{tname}: {len(ktexts)} samples — {how}", fontsize=9.5)
+    ax.legend(loc="upper left", fontsize=8.5, markerscale=2.5)
+    # enrichment bars
+    ax2 = fig.add_subplot(gs[1])
+    d = df.sort_values("log2_enrich", ascending=True) if df.log2_enrich.notna().any() else df.sort_values("size")
+    ys = np.arange(len(d))
+    vals = d.log2_enrich.fillna(0).values
+    ax2.barh(ys, vals, color=[C_T if v > 0 else C_R for v in vals], height=0.7, zorder=3)
+    ax2.axvline(0, color="#c3c2b7", lw=1); ax2.grid(True, axis="x", color=GRID, zorder=0); ax2.set_axisbelow(True)
+    for y, (_, r) in zip(ys, d.iterrows()):
+        cnt = ", ".join(f"{m}={int(r[f'n_{m}'])}" for m in models)
+        ax2.text((r.log2_enrich if r.log2_enrich == r.log2_enrich else 0) + (0.08 if vals[y] >= 0 else -0.08), y,
+                 f"c{int(r.cluster)}  [{cnt}]  {str(r.terms).split(' | ')[0]}", va="center", ha="left" if vals[y] >= 0 else "right", fontsize=7.5, color=INK2)
+    ax2.set_yticks([]); ax2.set_xlabel(f"log₂ enrichment  ({target} share ÷ {ref} share);  |≥{enrich_thresh}| = {target}-specific")
+    lim = max(2.5, float(np.nanmax(np.abs(vals))) + 2.2) if len(vals) else 3
+    ax2.set_xlim(-lim, lim); ax2.set_title("cluster composition", fontsize=11)
+    for sp in ["left"]:
+        ax2.spines[sp].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out / f"clusters_{safe}.png", dpi=160); plt.close(fig)
+
+    # hover-able HTML map (no external libraries)
+    pts = [dict(x=float(Y[i, 0]), y=float(Y[i, 1]), m=kmdl[i], c=int(labels[i]), t=ktexts[i][:300]) for i in range(len(ktexts))]
+    html = f"""<!doctype html><meta charset="utf-8"><title>{tname} clusters</title>
+<style>body{{font-family:system-ui,sans-serif;margin:16px;background:{SURF};color:{INK}}} canvas{{border:1px solid {GRID};background:{SURF}}}
+#tip{{position:fixed;max-width:520px;padding:8px 10px;background:#fff;border:1px solid #c3c2b7;border-radius:6px;font-size:12px;white-space:pre-wrap;pointer-events:none;display:none;box-shadow:0 2px 8px rgba(0,0,0,.08)}}
+.lg span{{display:inline-block;margin-right:14px}} .sw{{display:inline-block;width:10px;height:10px;border-radius:5px;margin-right:4px;vertical-align:middle}}</style>
+<h3 style="margin:0 0 6px">{tname}: {how} map — hover a point to read the sample; click a legend item to toggle</h3>
+<div class="lg" id="lg"></div><canvas id="cv" width="1400" height="820"></canvas><div id="tip"></div>
+<script>
+const P={_json.dumps(pts, ensure_ascii=False)}; const COL={_json.dumps(colors)};
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),tip=document.getElementById('tip');
+const xs=P.map(p=>p.x),ys=P.map(p=>p.y);const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+const pad=30,W=cv.width,H=cv.height;const sx=x=>pad+(x-x0)/(x1-x0)*(W-2*pad),sy=y=>H-pad-(y-y0)/(y1-y0)*(H-2*pad);
+const on={{}};Object.keys(COL).forEach(m=>on[m]=true);
+function draw(){{ctx.clearRect(0,0,W,H);for(const p of P){{if(!on[p.m])continue;ctx.globalAlpha=p.c<0?0.35:0.75;ctx.fillStyle=p.c<0?'#c3c2b7':COL[p.m];ctx.beginPath();ctx.arc(sx(p.x),sy(p.y),2.6,0,6.3);ctx.fill();}}
+ctx.globalAlpha=1;const cen={{}};for(const p of P){{if(p.c<0)continue;(cen[p.c]=cen[p.c]||[]).push(p);}}
+for(const c in cen){{const a=cen[c];const cx=a.reduce((s,p)=>s+p.x,0)/a.length,cy=a.reduce((s,p)=>s+p.y,0)/a.length;ctx.fillStyle='{INK}';ctx.font='bold 12px system-ui';ctx.fillText('c'+c,sx(cx)-8,sy(cy));}}}}
+const lg=document.getElementById('lg');for(const m in COL){{const s=document.createElement('span');s.innerHTML='<i class="sw" style="background:'+COL[m]+'"></i>'+m;s.style.cursor='pointer';s.onclick=()=>{{on[m]=!on[m];s.style.opacity=on[m]?1:.35;draw();}};lg.appendChild(s);}}
+cv.onmousemove=e=>{{const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let best=null,bd=64;for(const p of P){{if(!on[p.m])continue;const d=(sx(p.x)-mx)**2+(sy(p.y)-my)**2;if(d<bd){{bd=d;best=p;}}}}
+if(best){{tip.style.display='block';tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px';tip.textContent='['+best.m+'  cluster '+best.c+']\\n'+best.t;}}else tip.style.display='none';}};
+draw();</script>"""
+    (out / f"clusters_{safe}.html").write_text(html)
 
 
 def log2_enrichment(ct: int, nt: int, cr: int, nr: int) -> float:
@@ -576,6 +678,15 @@ def cmd_analyze(a: argparse.Namespace) -> None:
             report.append("(no clusters found)\n"); continue
         df = df.sort_values("log2_enrich" if have_ref else "size", ascending=False)
         df.to_csv(out / f"clusters_{tname.replace('/', '_')}.csv", index=False)
+        if a.plot:
+            try:
+                Y, how2d = project_2d(X)
+                plot_clusters(out, tname, Y, labels, kmdl, ktexts, df, target, ref, f"{how2d} of {emb_how} embeddings; clusters from {cl_how}", a.enrich_thresh)
+                report.append(f"\n![clusters]({'clusters_' + tname.replace('/', '_') + '.png'})  (hover version: clusters_{tname.replace('/', '_')}.html)\n")
+            except ImportError:
+                print("  [plot skipped: pip install umap-learn]")
+            except Exception as e:
+                print(f"  [plot skipped for {tname}: {e}]")
 
         # difficulty baseline: how much of the target's mass sits in target-only clusters
         if have_ref:
@@ -991,6 +1102,7 @@ def main() -> None:
     an.add_argument("--enrich-thresh", type=float, default=2.0, help="log2 enrichment to call a cluster target-specific (2 = 4x)")
     an.add_argument("--min-cluster-target", type=int, default=10)
     an.add_argument("--show", type=int, default=12, help="clusters to print per template")
+    an.add_argument("--plot", action="store_true", help="save clusters_<template>.png (map + enrichment) and .html (hover to read samples)")
     an.set_defaults(fn=cmd_analyze)
 
     tf = argparse.ArgumentParser(add_help=False)   # shared by the teacher-forced commands
