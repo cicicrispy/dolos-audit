@@ -3,3 +3,5 @@
 .env
 results/*
 results
+.DS_Store
+.DS_Store
